@@ -1,4 +1,4 @@
-import axios, { AxiosError, AxiosRequestConfig } from 'axios'
+import axios, { AxiosError, AxiosRequestConfig, AxiosResponse, Method } from 'axios'
 import https from 'https'
 import net from 'net'
 import { bgBlue, bgCyan, bgGray, bgGreen, bgRed, bgYellow, black, EventFormat } from '@smartthings/cli-lib'
@@ -166,26 +166,52 @@ export function handleConnectionErrors(authority: string, error: string): never 
 	}
 }
 
+type HostVerifier = (cert: PeerCertificate) => Promise<void>
+
 export class LiveLogClient {
 	private authority: string
-	private baseURL: URL
 	private driversURL: URL
 	private logsURL: URL
 	private authenticator: Authenticator
-	private requestConfig: AxiosRequestConfig
+	private hostVerified: boolean
+	private hostVerifier?: HostVerifier
 
-	constructor(authority: string, authenticator: Authenticator) {
+	constructor(authority: string, authenticator: Authenticator, hostVerifier?: HostVerifier) {
 		const baseURL = new URL(`https://${authority}`)
 
 		this.authority = authority
-		this.baseURL = baseURL
 		this.driversURL = new URL('drivers', baseURL)
 		this.logsURL = new URL('drivers/logs', baseURL)
 		this.authenticator = authenticator
-		this.requestConfig = {
+		this.hostVerified = hostVerifier === undefined
+		this.hostVerifier = hostVerifier
+	}
+
+	private async request(url: string, method: Method = 'GET'): Promise<AxiosResponse> {
+		const config = await this.authenticator.authenticate({
+			method: method,
+			url: url,
 			httpsAgent: new https.Agent({ rejectUnauthorized: false }),
 			timeout: 5000, // milliseconds
+		})
+
+		let response
+		try {
+			response = await axios.request(config)
+		} catch (error) {
+			if (error.isAxiosError) {
+				this.handleAxiosConnectionErrors(error)
+			}
+
+			throw error
 		}
+
+		if (!this.hostVerified && this.hostVerifier) {
+			await this.hostVerifier(this.getCertificate(response))
+			this.hostVerified = true
+		}
+
+		return response
 	}
 
 	private handleAxiosConnectionErrors(error: AxiosError): never | void {
@@ -200,33 +226,12 @@ export class LiveLogClient {
 		}
 	}
 
-	public async getCertificate(): Promise<PeerCertificate> {
-		const config = await this.authenticator.authenticate(this.requestConfig)
-
-		try {
-			const response = await axios.get(this.baseURL.toString(), config)
-			return ((response.request as ClientRequest).connection as TLSSocket).getPeerCertificate()
-		} catch (error) {
-			if (error.isAxiosError) {
-				this.handleAxiosConnectionErrors(error)
-			}
-
-			throw error
-		}
+	public getCertificate(response: AxiosResponse): PeerCertificate {
+		return ((response.request as ClientRequest).connection as TLSSocket).getPeerCertificate()
 	}
 
 	public async getDrivers(): Promise<DriverInfo[]> {
-		const config = await this.authenticator.authenticate(this.requestConfig)
-
-		try {
-			return (await axios.get(this.driversURL.toString(), config)).data
-		} catch (error) {
-			if (error.isAxiosError) {
-				this.handleAxiosConnectionErrors(error)
-			}
-
-			throw error
-		}
+		return (await this.request(this.driversURL.toString())).data
 	}
 
 	public async getLogSource(driverId?: string): Promise<string> {
